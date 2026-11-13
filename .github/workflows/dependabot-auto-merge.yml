@@ -9,7 +9,6 @@ permissions:
 jobs:
   automerge:
     runs-on: ubuntu-latest
-    # 显式排除 me 仓库（SniShaper-Fast），仅当仓库不是 me 且发起人为 dependabot[bot] 时运行
     if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository != 'SnishaperTeam/SniShaper-Fast'
     steps:
       - name: Fetch Dependabot metadata
@@ -18,9 +17,12 @@ jobs:
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
-      - name: Auto-rebase and merge patch and security updates
+      - name: Enable auto-merge for patch and security updates
+        # GitHub Actions updates are deliberately NOT auto-merged: a new major
+        # version of an action runs in CI with access to repo secrets before
+        # any human review, so those PRs must be merged by hand.
         if: steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.security-update == 'true'
-        run: gh pr merge --auto --rebase "$PR_URL"
+        run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

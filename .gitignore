@@ -6,9 +6,15 @@ build/bin/
 *.msi
 *.syso
 
+# Wails v3 task runner checksum cache
+.task/
+
 # Go cache / temp
 .gocache/
 *.test
+
+# Rules remote sync state (written next to the live rules file)
+rules_remote_sync.json
 
 # Frontend deps and build artifacts
 node_modules/
@@ -70,6 +76,7 @@ shaper-next/
 snishaper.zip
 Apppackage/
 blindtls-vercel/
+llm/
 
 # Custom ignores - added for mitmverify and cmd
 mitmverify.exe
@@ -97,7 +104,6 @@ build/bin/markers/
 /.workbuddy/
 
 .history/
-docs/
 .opencode/
 
 AGENTS.md
@@ -107,3 +113,10 @@ devcert.pfx
 
 # refactor backups
 reference/
+
+# IP scanner logs
+tools/logs/*
+!tools/logs/.gitkeep
+/.vs
+/.v2c/
+/spec/

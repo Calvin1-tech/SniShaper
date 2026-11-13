@@ -1,9 +1,10 @@
 # Build & Test
 
 - Build all: `.\build_windows.ps1 -Build all -Silent`
-- Build backend only: `.\build_windows.ps1 -Build backend -Silent`
-- Build frontend only: `.\build_windows.ps1 -Build frontend -Silent`
-- Build + MSIX: `.\build_windows.ps1 -Build all -Silent -BuildMsix`
+- Build backend only: `.\build_windows.ps1 -Build all,gui,backend -Silent`
+- Build frontend only: `.\build_windows.ps1 -Build all,gui,frontend -Silent`
+- Build + MSIX: `.\build_windows.ps1 -Build all -Silent -BuildMsix` (`-Build` format is `<system>,<mode>,<scope>`, e.g. `windows,gui,backend`; single token without comma is parsed as `<system>` only)
+- Headless CLI (linux/WSL TUN test): `$env:GOOS='linux'; $env:CGO_ENABLED='0'; go build -tags "headless with_gvisor" -o build/bin/snishaper-linux ./cli` (must include `with_gvisor`, otherwise TUN fails with "gVisor is not included in this build") then run in WSL2 as root: `./snishaper start && ./snishaper tun on`, test with `curl -k -m 15 <url>`, cleanup `./snishaper tun off && ./snishaper stop`; note: `stop` is async, so wait for processes to fully exit (`pgrep -x snishaper`) before the next `start` — core RPC is token-isolated (a stale instance can no longer kill a newly started core), but a zero-gap restart can still race the TUN device teardown and leave the data plane degraded
 - Frontend dev: `cd frontend && npm run dev`
 - Frontend install: `cd frontend && npm install`
 - Go mod tidy: `go mod tidy`
@@ -20,20 +21,27 @@ SniShaper is a Windows local proxy tool using ECH Injection, TLS-RF Fragmentatio
 - `/main.go` — entry point, Wails app + tray setup
 - `/app/` — Go backend: App struct, API bindings (`app_api.go`), system proxy (`app_system.go`), autostart
 - `/core/` — Mihomo core process management (`core_client.go`), TUN, admin elevation
-- `/proxy/` — Proxy server: MITM, SOCKS5, TLS fragmentation, TUN flow, auto-routing, rules
-- `/pkg/rules/gfwlist.go` — GFWList domain list: local file/reader loading + `IsBlocked` suffix match. NOTE: online update (fetch from URL, cache write) was removed; only local `gfwlist_cache.txt` (next to rules file) is loaded at startup, no network calls
-- `/pkg/` — Packages: cert manager, CF IP pool, DoH resolver, sysproxy, TLS fragmentation
-- `/evolution/` — Rule evolution testing: tester, rule generator, result analysis
+- `/proxy` — Proxy server (MITM, SOCKS5, TLS fragmentation, TUN flow, auto-routing, rules): no longer a local directory, imported from snishaper-core as `proxy`
+- `/pkg/` — Local packages only: a thin `sysproxy` facade; cert manager, CF IP pool, DoH resolver, netiface, singtun, subscription, TLS fragmentation and GFWList all live in snishaper-core
+- `evolution` — Rule evolution testing (tester, rule generator, result analysis) is `github.com/SnishaperTeam/snishaper-core/evolution`; there is no local `/evolution/` directory
 - `/frontend/src/` — React SPA: 10 pages (Dashboard, Proxies, Rules, Routing, DNS, Evolution, Logs, Settings, About, Welcome)
 - `/rules/config.json` — Site group rules (~3800 lines), MITM/ECH/SNI-fake configs
 - `/config/settings.json` — App settings (port, TUN, theme, Cloudflare IPs)
 
 Data flow: Frontend (React HashRouter) → Wails bindings (`EventsOn` + async Go calls) → App API → proxy/core subsystems. Frontend state sync via `app:state_changed` events from `emitFrontendState()`.
 
+# snishaper-core Dependency
+
+Engine and shared feature packages come from `github.com/SnishaperTeam/snishaper-core` (pinned in `go.mod`, **no `replace` directive**). This repo imports: `proxy`, `certmanager`, `cfpool`, `dohresolver`, `netiface`, `singtun`, `subscription`, `sysproxy`, `evolution`, `config` and `log`.
+
+- `pkg/sysproxy` is only a thin facade over core's `sysproxy.Manager`: one process-wide instance plus the original package-level helpers, so call sites are unchanged. Core's `Manager` is per-instance (no process-global proxy snapshot); the facade injects `SUDO_USER` via `sysproxy.WithRunAsUser`
+- `evolution` (rule evolution testing) has no local directory — it is `snishaper-core/evolution`
+- Core requires `^v0.4.0`: v0.4.0 moved `sysproxy` and `evolution` into the library, each app previously carrying a byte-identical copy
+
 # Conventions
 
 - Go: standard layout, `snishaper` module path, no external DI framework
-- Frontend: React 19 + TypeScript 6, `@/` path alias for `./src/`, MUI v9 + emotion for styling, `@heroicons/react` for icons
+- Frontend: React 19 + TypeScript 6, `@/` path alias for `./src/`, MUI v9 + emotion for styling, `@iconify/react` + `@iconify-icons/*` for icons (see `frontend/src/lib/icons.tsx`)
 - Error handling: log via `a.appendLog()`, return errors to frontend; no panic except top-level recover in `main.go`
 - Naming: Go `camelCase` for unexported, `PascalCase` for exported; TS `camelCase` for functions/vars, `PascalCase` for components/types
 - Imports: Go stdlib → third-party → internal; TS: React → components → API → i18n
@@ -43,14 +51,14 @@ Data flow: Frontend (React HashRouter) → Wails bindings (`EventsOn` + async Go
 - i18n placeholders: param names passed to `t('k', {...})` must match `{param}` placeholders in all three locales (shorthand props like `{ ms }` count as params); keep the key tree structurally identical across zh/en/ru
 - i18n coverage: aria-label / placeholder / title / toast / button text must go through `t()`; add new UI copy to ALL of zh/en/ru JSON in the same commit
 - Git: commit messages MUST be written in English (user requirement), conventional-commit style, e.g. `refactor: remove GFWList dynamic update and complete i18n`
+- Wiki: any change that alters a file's purpose/nature, adds new files, or renames/removes files MUST update the GitHub Wiki in the same change (zh + EN pages; clone `https://github.com/SnishaperTeam/SniShaper.wiki.git`, naming: `Page.md` = zh, `EN-Page.md` = en)
 
 # Security & Environment
 
-- Dev certificate: `devcert.pfx` (password: `password`)
-- Cert manager generates CA at `pkg/certmanager/` (runtime, gitignored)
+- MSIX signing: the release pipeline restores the pfx from the `MSIX_PFX_BASE64` secret (password `MSIX_PFX_PASSWORD`); without it an ephemeral cert is generated per build. A local untracked `devcert.pfx` may exist for dev signing. Release bundles ship only the public `devcert.cer` — never the pfx or its password
+- Cert manager lives in snishaper-core (`certmanager`); it writes the CA under the per-user config dir (runtime, gitignored)
 - Admin rights required for system proxy registry writes and TUN
 - Registry access via `golang.org/x/sys/windows/registry` (not `reg.exe`)
-- MSIX packaging requires PFX signing cert; CI uses self-signed
 
 # Evidence Required
 

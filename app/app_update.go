@@ -1,8 +1,8 @@
-//go:build !headless
-
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ var downloadSourceOrder = []string{
 }
 
 var downloadSources = map[string]string{
+	"smart":                "",
 	"direct":               "",
 	"down.mxw.qzz.io":      "https://down.mxw.qzz.io/",
 	"gh-proxy.org":         "https://gh-proxy.org/",
@@ -48,6 +50,18 @@ var downloadSources = map[string]string{
 }
 
 const defaultDownloadSource = "down.mxw.qzz.io"
+
+const smartSourceCacheTTL = 10 * time.Minute
+
+const (
+	sourcePurposeRelease = "release"
+	sourcePurposeRaw     = "raw"
+)
+
+var sourceProbes = map[string]string{
+	sourcePurposeRelease: "https://github.com/" + githubRepo + "/releases/latest",
+	sourcePurposeRaw:     "https://raw.githubusercontent.com/" + githubRepo + "/main/rules/config.json",
+}
 
 type githubRelease struct {
 	TagName    string        `json:"tag_name"`
@@ -62,6 +76,9 @@ type githubAsset struct {
 	Name        string `json:"name"`
 	Size        int64  `json:"size"`
 	DownloadURL string `json:"browser_download_url"`
+	// Digest is the "sha256:..." digest reported by the GitHub Releases API.
+	// Only the value from the official api.github.com endpoint is trusted.
+	Digest string `json:"digest"`
 }
 
 var validUpdateChannels = map[string]string{
@@ -111,6 +128,27 @@ func (a *App) SetCustomDownloadSource(prefix string) error {
 	return a.ruleManager.SetCustomDownloadSource(prefix)
 }
 
+// UpdateChannels lists the channels CheckUpdate accepts, so callers can show
+// the valid values instead of hardcoding them.
+func UpdateChannels() []string {
+	names := make([]string, 0, len(validUpdateChannels))
+	for name := range validUpdateChannels {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// DownloadSources lists the download source prefixes the updater understands.
+func DownloadSources() []string {
+	names := make([]string, 0, len(downloadSources))
+	for name := range downloadSources {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 type DownloadSourceStatus struct {
 	Name      string `json:"name"`
 	URL       string `json:"url"`
@@ -131,7 +169,7 @@ func (a *App) MeasureDownloadSources() []DownloadSourceStatus {
 		wg.Add(1)
 		go func(i int, tg target) {
 			defer wg.Done()
-			results[i] = measureSourceLatency(tg.name, tg.prefix)
+			results[i] = measureSourceLatency(tg.name, tg.prefix, sourceProbes[sourcePurposeRelease])
 		}(i, tg)
 	}
 	wg.Wait()
@@ -144,15 +182,15 @@ func (a *App) MeasureDownloadSources() []DownloadSourceStatus {
 	return results
 }
 
-func measureSourceLatency(name, prefix string) DownloadSourceStatus {
-	probe := "https://github.com/SnishaperTeam/SniShaper/releases/latest"
+func measureSourceLatency(name, prefix, probe string) DownloadSourceStatus {
+	target := probe
 	if prefix != "" {
-		probe = prefix + probe
+		target = prefix + probe
 	}
-	st := DownloadSourceStatus{Name: name, URL: probe}
+	st := DownloadSourceStatus{Name: name, URL: target}
 	client := &http.Client{Timeout: 5 * time.Second}
 	start := time.Now()
-	req, err := http.NewRequest(http.MethodHead, probe, nil)
+	req, err := http.NewRequest(http.MethodHead, target, nil)
 	if err != nil {
 		st.Error = err.Error()
 		return st
@@ -165,8 +203,119 @@ func measureSourceLatency(name, prefix string) DownloadSourceStatus {
 		return st
 	}
 	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		st.Error = fmt.Sprintf("http status %d", resp.StatusCode)
+		return st
+	}
 	st.OK = true
 	return st
+}
+
+type downloadSourceEntry struct {
+	label  string
+	prefix string
+}
+
+// rankedSourceOrder measures every mirror against the probe for the given
+// purpose and returns the reachable ones fastest first, so the "smart" source
+// always points at the quickest mirror for that kind of request.
+func (a *App) rankedSourceOrder(purpose string) []string {
+	probe, ok := sourceProbes[purpose]
+	if !ok {
+		probe = sourceProbes[sourcePurposeRelease]
+	}
+
+	a.sourceRankMu.Lock()
+	cached, at := a.sourceRankCache[purpose], a.sourceRankAt[purpose]
+	a.sourceRankMu.Unlock()
+	if len(cached) > 0 && time.Since(at) < smartSourceCacheTTL {
+		return cached
+	}
+
+	names := append([]string{"direct"}, downloadSourceOrder...)
+	type sample struct {
+		name      string
+		latencyMS int64
+		ok        bool
+	}
+	samples := make([]sample, len(names))
+	var wg sync.WaitGroup
+	for i, name := range names {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			st := measureSourceLatency(name, downloadSources[name], probe)
+			samples[i] = sample{name: name, latencyMS: st.LatencyMS, ok: st.OK}
+		}(i, name)
+	}
+	wg.Wait()
+
+	sort.SliceStable(samples, func(i, j int) bool {
+		if samples[i].ok != samples[j].ok {
+			return samples[i].ok
+		}
+		return samples[i].latencyMS < samples[j].latencyMS
+	})
+	order := make([]string, 0, len(samples))
+	for _, s := range samples {
+		if s.ok {
+			order = append(order, s.name)
+		}
+	}
+	if len(order) == 0 {
+		order = names
+	}
+
+	a.sourceRankMu.Lock()
+	if a.sourceRankCache == nil {
+		a.sourceRankCache = map[string][]string{}
+		a.sourceRankAt = map[string]time.Time{}
+	}
+	a.sourceRankCache[purpose], a.sourceRankAt[purpose] = order, time.Now()
+	a.sourceRankMu.Unlock()
+	a.appendLog(fmt.Sprintf("[update] smart source ranking (%s): %s", purpose, strings.Join(order, " > ")))
+	return order
+}
+
+// downloadSourceEntries lists the mirrors to try for the configured download
+// source, in order: the configured one first, then direct, then the rest.
+func (a *App) downloadSourceEntries(purpose string) []downloadSourceEntry {
+	src := a.GetDownloadSource()
+	entries := []downloadSourceEntry{}
+	seen := map[string]bool{}
+	add := func(label, prefix string) {
+		if seen[prefix] {
+			return
+		}
+		seen[prefix] = true
+		entries = append(entries, downloadSourceEntry{label: label, prefix: prefix})
+	}
+
+	switch src {
+	case "custom":
+		if p := strings.TrimRight(a.GetCustomDownloadSource(), "/"); p != "" {
+			add("custom", p+"/")
+		}
+	case "smart":
+		for _, name := range a.rankedSourceOrder(purpose) {
+			add(name, downloadSources[name])
+		}
+	case "direct", "":
+		add("direct", "")
+	default:
+		if p, ok := downloadSources[src]; ok {
+			add(src, p)
+		}
+	}
+
+	add("direct", "")
+	for _, name := range downloadSourceOrder {
+		if name == src {
+			continue
+		}
+		add(name, downloadSources[name])
+	}
+	return entries
 }
 
 func (a *App) GetReleaseChannel() string {
@@ -248,45 +397,69 @@ func (a *App) CheckUpdate() CheckUpdateResult {
 
 func (a *App) fetchGitHubReleases() ([]githubRelease, error) {
 	apiURL := githubAPIBase + "/releases?per_page=100"
-	urls := []string{apiURL, githubProxyBase + apiURL}
-	var lastErr error
-	for _, u := range urls {
-		req, err := http.NewRequest(http.MethodGet, u, nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("User-Agent", updateUserAgent)
-		req.Header.Set("Accept", "application/vnd.github+json")
-		client := &http.Client{Timeout: 20 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
-			return nil, fmt.Errorf("rate_limited")
-		}
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("http status %d", resp.StatusCode)
-			resp.Body.Close()
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		var releases []githubRelease
-		if err := json.Unmarshal(body, &releases); err != nil {
-			lastErr = err
-			continue
-		}
+	// Official API first; the mirror is only a fallback for listing releases.
+	releases, err := fetchReleasesFromURL(apiURL)
+	if err == nil {
 		return releases, nil
 	}
-	return nil, lastErr
+	if mirrorReleases, mirrorErr := fetchReleasesFromURL(githubProxyBase + apiURL); mirrorErr == nil {
+		return mirrorReleases, nil
+	}
+	return nil, err
+}
+
+func fetchReleasesFromURL(apiURL string) ([]githubRelease, error) {
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", updateUserAgent)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		resp.Body.Close()
+		return nil, fmt.Errorf("rate_limited")
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("http status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	var releases []githubRelease
+	if err := json.Unmarshal(body, &releases); err != nil {
+		return nil, err
+	}
+	return releases, nil
+}
+
+// fetchOfficialAssetDigest resolves the expected SHA-256 of a release asset
+// from the official GitHub API. Mirror responses are never used here.
+func (a *App) fetchOfficialAssetDigest(assetURL string) (string, error) {
+	releases, err := fetchReleasesFromURL(githubAPIBase + "/releases?per_page=100")
+	if err != nil {
+		return "", err
+	}
+	for _, rel := range releases {
+		for _, asset := range rel.Assets {
+			if asset.DownloadURL != assetURL {
+				continue
+			}
+			digest := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(asset.Digest)), "sha256:")
+			if digest == "" {
+				return "", fmt.Errorf("official GitHub API did not provide a digest for %s", asset.Name)
+			}
+			return digest, nil
+		}
+	}
+	return "", fmt.Errorf("asset not found on official GitHub releases: %s", assetURL)
 }
 
 func resolveChannelRelease(releases []githubRelease, channel string) *githubRelease {
@@ -325,6 +498,73 @@ func releaseRank(rel githubRelease) int {
 	}
 }
 
+// assetArchToken maps the architecture tokens used in release asset names to
+// one canonical value, so amd64/x64 and 386/x86 compare equal.
+func assetArchToken(lower string) string {
+	switch {
+	case strings.Contains(lower, "arm64"), strings.Contains(lower, "aarch64"):
+		return "arm64"
+	case strings.Contains(lower, "x86_64"), strings.Contains(lower, "amd64"),
+		strings.Contains(lower, "x64"):
+		return "x64"
+	case strings.Contains(lower, "386"), strings.Contains(lower, "x86"):
+		return "x86"
+	}
+	return ""
+}
+
+func runtimeAssetArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x64"
+	case "386":
+		return "x86"
+	case "arm64":
+		return "arm64"
+	}
+	return runtime.GOARCH
+}
+
+// assetOSToken resolves the target OS of an asset name; an installer named
+// only by its .exe suffix belongs to Windows.
+func assetOSToken(lower string) string {
+	switch {
+	case strings.Contains(lower, "windows"):
+		return "windows"
+	case strings.Contains(lower, "linux"):
+		return "linux"
+	case strings.Contains(lower, "darwin"), strings.Contains(lower, "macos"), strings.Contains(lower, "osx"):
+		return "darwin"
+	case strings.HasSuffix(lower, ".exe"):
+		return "windows"
+	}
+	return ""
+}
+
+func isCLIAsset(lower string) bool {
+	return strings.HasPrefix(lower, "snishaper-cli-")
+}
+
+// assetMatchesRuntime keeps only the packages the running process can install:
+// same OS, same architecture, and the flavour of this binary. The signed MSIX
+// bundle (dongle.*.zip / dongle.*.7z) is dropped as well, since it carries no
+// snishaper.exe the in-app updater could extract.
+func assetMatchesRuntime(lower string) bool {
+	if strings.Contains(lower, "unsigned") || strings.HasPrefix(lower, "dongle.") {
+		return false
+	}
+	if strings.HasPrefix(lower, "snishaperupdater-") || strings.HasSuffix(lower, "-update.zip") {
+		return false
+	}
+	if isCLIAsset(lower) != headlessBuild {
+		return false
+	}
+	if osName := assetOSToken(lower); osName != "" && osName != runtime.GOOS {
+		return false
+	}
+	return assetArchToken(lower) == runtimeAssetArch()
+}
+
 func filterUpdateAssets(assets []githubAsset) []ReleaseAsset {
 	result := []ReleaseAsset{}
 	for _, asset := range assets {
@@ -333,9 +573,22 @@ func filterUpdateAssets(assets []githubAsset) []ReleaseAsset {
 		switch {
 		case strings.HasSuffix(lower, ".exe"):
 			kind = "exe"
-		case strings.HasSuffix(lower, ".7z") && !strings.Contains(lower, "_x64.7z") && !strings.Contains(lower, "_x86.7z") && !strings.Contains(lower, "_arm64.7z") && !strings.Contains(lower, "unsigned"):
+		case strings.HasSuffix(lower, ".zip"):
+			// Portable bundle in the format every supported Windows version
+			// can open on its own; macOS ships its .app as a zip as well.
+			kind = "zip"
+		case strings.HasSuffix(lower, ".7z"):
+			// Legacy archive kept for releases published before the switch
+			// to zip: the Windows installer still understands it.
 			kind = "7z"
+		case strings.HasSuffix(lower, ".tar.gz"):
+			// Portable bundle used by the Linux build, and the only archive
+			// the Linux installer can unpack on its own.
+			kind = "tar.gz"
 		default:
+			continue
+		}
+		if !assetMatchesRuntime(lower) {
 			continue
 		}
 		result = append(result, ReleaseAsset{
@@ -345,10 +598,29 @@ func filterUpdateAssets(assets []githubAsset) []ReleaseAsset {
 			Kind:        kind,
 		})
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		return assetKindRank(result[i].Kind) < assetKindRank(result[j].Kind)
+	})
 	return result
 }
 
-func buildDownloadURLs(assetURL, preferred, customPrefix string) []string {
+// assetKindRank orders the update list: installer first, then the portable
+// zip, then the legacy 7z archive, then the tarball the Linux build installs
+// from. A release that ships both formats therefore offers the one Windows 10
+// can open natively.
+func assetKindRank(kind string) int {
+	switch kind {
+	case "exe":
+		return 0
+	case "zip":
+		return 1
+	case "7z":
+		return 2
+	}
+	return 3
+}
+
+func buildDownloadURLs(assetURL string, entries []downloadSourceEntry) []string {
 	seen := map[string]bool{}
 	var urls []string
 	add := func(u string) {
@@ -361,20 +633,10 @@ func buildDownloadURLs(assetURL, preferred, customPrefix string) []string {
 		add(assetURL)
 		return urls
 	}
-	if p := downloadSources[preferred]; p != "" {
-		add(p + assetURL)
-	} else if preferred == "custom" {
-		add(strings.TrimRight(customPrefix, "/") + "/" + assetURL)
+	for _, e := range entries {
+		add(e.prefix + assetURL)
 	}
 	add(assetURL)
-	for _, k := range downloadSourceOrder {
-		if k == preferred {
-			continue
-		}
-		if p := downloadSources[k]; p != "" {
-			add(p + assetURL)
-		}
-	}
 	return urls
 }
 
@@ -474,7 +736,29 @@ func compareReleaseVersions(current, currentChannel, target, targetChannel strin
 	return 0
 }
 
+// fileSHA256Hex streams a file through SHA-256 and returns the lowercase hex digest.
+func fileSHA256Hex(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func (a *App) DownloadUpdateAsset(assetURL string) (DownloadResult, error) {
+	// Resolve the expected SHA-256 from the official GitHub API before
+	// downloading. Without a trusted digest the update is rejected outright.
+	expectedSHA, err := a.fetchOfficialAssetDigest(assetURL)
+	if err != nil {
+		a.appendLog("[update] Integrity check unavailable (official GitHub API): " + err.Error())
+		return DownloadResult{}, fmt.Errorf("update integrity check unavailable: %v", err)
+	}
+
 	fileName := filepath.Base(strings.SplitN(assetURL, "?", 2)[0])
 	if fileName == "." || fileName == "/" || fileName == "" {
 		fileName = "snishaper-update.bin"
@@ -484,7 +768,7 @@ func (a *App) DownloadUpdateAsset(assetURL string) (DownloadResult, error) {
 		return DownloadResult{}, err
 	}
 	dest := filepath.Join(dir, fileName)
-	urls := buildDownloadURLs(assetURL, a.ruleManager.GetDownloadSource(), a.ruleManager.GetCustomDownloadSource())
+	urls := buildDownloadURLs(assetURL, a.downloadSourceEntries(sourcePurposeRelease))
 	var lastErr error
 	for _, u := range urls {
 		if err := a.downloadFileWithProgress(u, dest, fileName); err != nil {
@@ -492,7 +776,22 @@ func (a *App) DownloadUpdateAsset(assetURL string) (DownloadResult, error) {
 			a.appendLog("[update] Download attempt failed: " + u + " -> " + err.Error())
 			continue
 		}
-		a.SetPendingUpdate(dest)
+		// Verify the downloaded bytes; a tampered mirror is treated like a
+		// failed download and the next source is tried.
+		sum, hashErr := fileSHA256Hex(dest)
+		if hashErr != nil {
+			lastErr = hashErr
+			os.Remove(dest)
+			a.appendLog("[update] Hashing failed for " + dest + ": " + hashErr.Error())
+			continue
+		}
+		if !strings.EqualFold(sum, expectedSHA) {
+			lastErr = fmt.Errorf("integrity check failed for %s: expected sha256 %s, got %s", fileName, expectedSHA, sum)
+			os.Remove(dest)
+			a.appendLog("[update] " + lastErr.Error())
+			continue
+		}
+		a.setPendingUpdateVerified(dest, expectedSHA)
 		return DownloadResult{LocalPath: dest, Size: fileSize(dest)}, nil
 	}
 	return DownloadResult{}, lastErr
@@ -503,32 +802,33 @@ const (
 	defaultDownloadChunkSize   = 8 * 1024 * 1024
 )
 
+// initDownloadTuning resolves the env-tunable download settings once at
+// startup, so the download goroutines read plain fields instead of racing on
+// lazy writes.
+func initDownloadTuning() (concurrency int, chunkSize int64) {
+	concurrency = defaultDownloadConcurrency
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("DOWNLOAD_CONCURRENCY"))); err == nil && v > 0 {
+		concurrency = v
+	}
+	chunkSize = defaultDownloadChunkSize
+	if v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("DOWNLOAD_CHUNK_SIZE")), 10, 64); err == nil && v > 0 {
+		chunkSize = v
+	}
+	return concurrency, chunkSize
+}
+
 func (a *App) getDownloadConcurrency() int {
 	if a.downloadConcurrency > 0 {
 		return a.downloadConcurrency
 	}
-	n := defaultDownloadConcurrency
-	if s := strings.TrimSpace(os.Getenv("DOWNLOAD_CONCURRENCY")); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v > 0 {
-			n = v
-		}
-	}
-	a.downloadConcurrency = n
-	return n
+	return defaultDownloadConcurrency
 }
 
 func (a *App) getDownloadChunkSize() int64 {
 	if a.downloadChunkSize > 0 {
 		return a.downloadChunkSize
 	}
-	n := int64(defaultDownloadChunkSize)
-	if s := strings.TrimSpace(os.Getenv("DOWNLOAD_CHUNK_SIZE")); s != "" {
-		if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
-			n = v
-		}
-	}
-	a.downloadChunkSize = n
-	return n
+	return defaultDownloadChunkSize
 }
 
 func (a *App) downloadConcurrencyFn() download.ConcurrencyFn {
@@ -682,7 +982,7 @@ func (a *App) emitDownloadProgress(name string, received, total int64, speed flo
 		percent = float64(received) / float64(total) * 100
 	}
 	a.invokeAsync(func() {
-		if a.mainWindow == nil || a.shouldQuit {
+		if !a.hasUI() || a.shouldQuit {
 			return
 		}
 		a.emitEvent("update:download_progress", map[string]interface{}{
@@ -712,10 +1012,41 @@ func (a *App) SetPendingUpdate(path string) {
 	a.pendingUpdateMu.Lock()
 	defer a.pendingUpdateMu.Unlock()
 	a.pendingUpdatePath = path
+	a.pendingUpdateSHA = ""
+}
+
+// setPendingUpdateVerified records the verified download together with the
+// SHA-256 it was validated against, so the installer can re-check the file
+// right before executing it.
+func (a *App) setPendingUpdateVerified(path, expectedSHA string) {
+	a.pendingUpdateMu.Lock()
+	defer a.pendingUpdateMu.Unlock()
+	a.pendingUpdatePath = path
+	a.pendingUpdateSHA = expectedSHA
 }
 
 func (a *App) InstallUpdateAsset(localPath string) error {
-	err := a.installUpdateAsset(localPath)
+	// Only the file this session downloaded and hash-verified may be
+	// installed. This binding executes a binary with the app's privileges,
+	// so an arbitrary caller-supplied path must never reach the installer —
+	// anything else goes through DownloadUpdateAsset first.
+	a.pendingUpdateMu.Lock()
+	pendingPath, expectedSHA := a.pendingUpdatePath, a.pendingUpdateSHA
+	a.pendingUpdateMu.Unlock()
+	if pendingPath == "" || expectedSHA == "" {
+		return fmt.Errorf("no verified update download; run the update download step first")
+	}
+	if !strings.EqualFold(localPath, pendingPath) {
+		return fmt.Errorf("refusing to install %s: it is not the verified update download", localPath)
+	}
+	sum, err := fileSHA256Hex(localPath)
+	if err != nil {
+		return fmt.Errorf("update integrity re-check failed: %v", err)
+	}
+	if !strings.EqualFold(sum, expectedSHA) {
+		return fmt.Errorf("update file changed after download (sha256 mismatch), refusing to install")
+	}
+	err = a.installUpdateAsset(localPath)
 	if err == nil {
 		a.SetPendingUpdate("")
 	}

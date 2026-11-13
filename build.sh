@@ -85,8 +85,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # ---------- Go module proxy (overridable via env) ----------
+# Comma-separated fallback list: Go walks it left to right and falls through
+# on 404/410, so a mirror that is unreachable from the current network (or
+# rate-limited) does not fail the build. goproxy.cn is listed first because
+# it is the fastest from mainland China, proxy.golang.org is the canonical
+# upstream and also serves as the fallback outside China.
+# CI overrides this with the official source only (see the workflows).
 if [ -z "${GOPROXY:-}" ]; then
-    export GOPROXY="https://goproxy.cn,direct"
+    export GOPROXY="https://goproxy.cn,https://proxy.golang.org,direct"
 fi
 
 # ===========================================================================
@@ -775,13 +781,16 @@ ensure_frontend() {
 }
 
 copy_seed_folders() {
-    if [ -d config ]; then
-        mkdir -p "$1/config"
-        cp -R config/. "$1/config/"
-    fi
+    # rules: force-overwrite contents on every build so rule updates land.
+    # config: seed only when missing; the runtime settings.json next to the
+    # binary belongs to the user and must survive rebuilds.
     if [ -d rules ]; then
         mkdir -p "$1/rules"
         cp -R rules/. "$1/rules/"
+    fi
+    if [ -d config ] && [ ! -d "$1/config" ]; then
+        mkdir -p "$1/config"
+        cp -R config/. "$1/config/"
     fi
 }
 

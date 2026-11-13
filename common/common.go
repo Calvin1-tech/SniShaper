@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/SnishaperTeam/snishaper-core/config"
 )
 
 type RingLogWriter struct {
@@ -111,6 +113,15 @@ func UserConfigDir() string {
 	}
 	return filepath.Join(dir, "snishaper")
 }
+
+// 共享类型与辅助函数已迁入 snishaper-core 的 config 包；
+// 这里保留别名，让应用侧既有引用（含 JSON 结构）无需改动。
+type CertVerifyConfig = config.CertVerifyConfig
+
+var (
+	MapNAT64Addr = config.MapNAT64Addr
+	HalfClose    = config.HalfClose
+)
 
 // UserConfigPath maps a runtime-relative path (e.g. config/settings.json)
 // into the per-user config directory.

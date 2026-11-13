@@ -4,9 +4,18 @@ package app
 
 import (
 	"context"
+	"log"
+	"runtime"
+	"runtime/debug"
+	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
 )
+
+// headlessBuild is false here: the desktop build lists the desktop packages,
+// never the snishaper-cli-* archives.
+const headlessBuild = false
 
 // Typed accessors for the GUI-only UI references (stored as `any` on App
 // so the headless build never links the wails runtime).
@@ -72,8 +81,137 @@ func (a *App) SetMainWindow(w *application.WebviewWindow) {
 			a.pendingShow = false
 		}
 	} else {
-		a.mainWindow = w
+		a.mainWindow = nil
+		go func() {
+			runtime.GC()
+			debug.FreeOSMemory()
+		}()
 	}
+}
+
+// liveMainWindow returns the tracked main window while the runtime still knows
+// about it, and drops the reference once it doesn't. The runtime removes a
+// window from its window manager as part of destroying it, which happens on a
+// goroutine of its own, so a close can land on this app after the native window
+// is already gone. WebviewWindow methods are inert on such a window - Show()
+// falls back to Run(), which returns immediately because impl is still set - so
+// a stale reference would silently swallow every later attempt to bring the
+// window back.
+func (a *App) liveMainWindow() *application.WebviewWindow {
+	if a.mainWindow == nil {
+		return nil
+	}
+	w := a.mainWindowInstance()
+	wailsApp := a.wailsAppInstance()
+	if w == nil || wailsApp == nil {
+		return w
+	}
+	if _, ok := wailsApp.Window.GetByID(w.ID()); !ok {
+		log.Printf("[window] main window no longer registered, dropping stale reference")
+		a.SetMainWindow(nil)
+		return nil
+	}
+	return w
+}
+
+// hasMainWindow reports whether a live main window is tracked.
+func (a *App) hasMainWindow() bool { return a.liveMainWindow() != nil }
+
+// hasUI reports whether app state can be delivered to a UI. The desktop build
+// needs a live window for that; the headless build (app_headless.go) pushes
+// state to the adapter a frontend installs instead.
+func (a *App) hasUI() bool { return a.hasMainWindow() }
+
+func (a *App) IsHibernated() bool { return a.mainWindow == nil && !a.shouldQuit }
+
+func (a *App) IsMainWindowVisible() bool {
+	w := a.liveMainWindow()
+	if w == nil {
+		return false
+	}
+	return w.IsVisible()
+}
+
+func (a *App) HibernateMainWindow() {
+	if a.mainWindow == nil {
+		return
+	}
+	w := a.mainWindowInstance()
+	log.Printf("[window] hibernate: releasing the frontend")
+	// Release the reference first: the close handler treats a nil reference as
+	// an app owned teardown and lets the runtime destroy the window.
+	a.mainWindow = nil
+	go func() {
+		w.Close()
+		time.Sleep(200 * time.Millisecond)
+		runtime.GC()
+		debug.FreeOSMemory()
+		a.setTrayTooltip("SniShaper - 前端已休眠，点击托盘恢复")
+	}()
+}
+
+func (a *App) ensureMainWindow() *application.WebviewWindow {
+	if w := a.liveMainWindow(); w != nil {
+		return w
+	}
+	wailsApp := a.wailsAppInstance()
+	if wailsApp == nil {
+		a.pendingShow = true
+		return nil
+	}
+	log.Printf("[window] creating main window")
+	w := wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
+		Name:             "main",
+		Title:            "SniShaper",
+		Width:            1024,
+		Height:           768,
+		URL:              "/",
+		Frameless:        true,
+		Hidden:           false,
+		BackgroundColour: application.NewRGB(27, 38, 54),
+	})
+	a.AttachMainWindowHandlers(w)
+	a.SetMainWindow(w)
+	return w
+}
+
+// AttachMainWindowHandlers installs the close handling of a main window.
+//
+// The handler has to be a hook, not a listener. The runtime registers its own
+// Common.WindowClosing listener that destroys the window unconditionally; hooks
+// run synchronously and stop the dispatch before any listener goroutine is
+// spawned, whereas listeners are all started concurrently. Cancelling the event
+// from a listener therefore races the runtime's destroy handler and normally
+// loses, which destroyed the window even with "close to tray" enabled and left
+// the app without any way to show its UI again.
+func (a *App) AttachMainWindowHandlers(w *application.WebviewWindow) {
+	w.RegisterHook(events.Common.WindowClosing, func(event *application.WindowEvent) {
+		a.handleWindowClosing(event, w)
+	})
+}
+
+func (a *App) handleWindowClosing(event *application.WindowEvent, w *application.WebviewWindow) {
+	if a.shouldQuit || a.mainWindow == nil {
+		// Quitting, or a teardown this app already owns (hibernate): let the
+		// runtime destroy the window.
+		return
+	}
+	// Keep the close under app control so the runtime cannot destroy a window
+	// the app still needs.
+	event.Cancel()
+	if a.GetHibernateOnClose() {
+		a.HibernateMainWindow()
+		a.RebuildSystemTray()
+		return
+	}
+	if a.GetCloseToTray() {
+		w.Hide()
+		log.Printf("[window] close: hidden to tray")
+		a.RebuildSystemTray()
+		return
+	}
+	log.Printf("[window] close: quitting application")
+	a.QuitApp()
 }
 
 // SetSystemTray sets the system tray reference.
@@ -96,6 +234,7 @@ func (a *App) ServiceStartup(ctx context.Context, options application.ServiceOpt
 }
 
 func (a *App) ServiceShutdown() error {
+	stopInstanceListener()
 	a.shutdown()
 	return nil
 }
@@ -105,39 +244,44 @@ func (a *App) ServiceShutdown() error {
 // the UIAdapter when one is installed.
 
 func (a *App) emitEvent(event string, payload interface{}) {
-	if a.mainWindow != nil {
-		a.mainWindowInstance().EmitEvent(event, payload)
+	if w := a.liveMainWindow(); w != nil {
+		w.EmitEvent(event, payload)
 	}
 }
 
 func (a *App) showMainWindow() {
-	if a.mainWindow != nil {
-		a.mainWindowInstance().Show()
-		a.mainWindowInstance().Focus()
+	if w := a.liveMainWindow(); w != nil {
+		w.Show()
+		w.Focus()
+		return
+	}
+	if w := a.ensureMainWindow(); w != nil {
+		w.Show()
+		w.Focus()
 	}
 }
 
 func (a *App) hideMainWindow() {
-	if a.mainWindow != nil {
-		a.mainWindowInstance().Hide()
+	if w := a.liveMainWindow(); w != nil {
+		w.Hide()
 	}
 }
 
 func (a *App) minimiseMainWindow() {
-	if a.mainWindow != nil {
-		a.mainWindowInstance().Minimise()
+	if w := a.liveMainWindow(); w != nil {
+		w.Minimise()
 	}
 }
 
 func (a *App) toggleMaximiseMainWindow() {
-	if a.mainWindow != nil {
-		a.mainWindowInstance().ToggleMaximise()
+	if w := a.liveMainWindow(); w != nil {
+		w.ToggleMaximise()
 	}
 }
 
 func (a *App) closeMainWindow() {
-	if a.mainWindow != nil {
-		a.mainWindowInstance().Close()
+	if w := a.liveMainWindow(); w != nil {
+		w.Close()
 	}
 }
 

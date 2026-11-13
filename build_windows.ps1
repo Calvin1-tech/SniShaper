@@ -77,8 +77,9 @@
 #   -Wails             build the GUI through the Wails CLI instead of go build
 #   -Silent            never prompt
 #   -InstallDeps       run npm install before the frontend build
-#   -BuildMsix         package (and sign) an MSIX from the Windows GUI output
-#   -SkipSign          package but do not sign (unsigned_*.msix)
+#   -BuildMsix         package every built Windows GUI architecture into
+#                      build\bin\gui\Windows\<name>_<version>_<arch...>.msixbundle
+#   -SkipSign          package but do not sign (unsigned_ prefix)
 #   -Gtk3              build the Linux GUI against GTK3/WebKit2GTK-4.1
 #   -Help              show this help
 #
@@ -215,6 +216,20 @@ try {
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
+
+# ---------------------------------------------------------------------------
+# Go module proxy (overridable via env)
+# Comma-separated fallback list: Go walks it left to right and falls through
+# on 404/410, so a mirror that is unreachable from the current network (or
+# rate-limited) does not fail the build. goproxy.cn is listed first because
+# it is the fastest from mainland China, proxy.golang.org is the canonical
+# upstream and also serves as the fallback outside China.
+# CI overrides this with the official source only (see the workflows).
+# ---------------------------------------------------------------------------
+if (-not $env:GOPROXY) {
+    $env:GOPROXY = 'https://goproxy.cn,https://proxy.golang.org,direct'
+}
+Write-Host "[build] GOPROXY=$env:GOPROXY"
 
 # Kill any running snishaper instances before build
 Get-Process -Name "snishaper" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -851,13 +866,23 @@ function Sync-VersionResource {
     # repository, so non-Windows builds never see a Windows resource object.
     # The generated file is removed again after the build (see
     # Invoke-BuildTarget) so the working tree stays clean.
+    #
+    # Returns $true only when the .syso is actually in place. Everything the
+    # exe shows to Windows and Explorer (RT_GROUP_ICON, RT_VERSION,
+    # RT_MANIFEST) lives in that one file, so a Windows target must abort when
+    # it is missing rather than ship an unbranded, version-less and
+    # DPI-unaware binary.
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $WinResPath = Join-Path $ProjectRoot "winres\winres.json"
     $GenSyso = Join-Path $ProjectRoot ("rsrc_windows_" + $TargetGoArch + ".syso")
-    if (-not (Test-Path $WinResPath)) { return }
+    if (-not (Test-Path $WinResPath)) {
+        Write-Host (msg -Key "BackSyncVerFail") -ForegroundColor Red
+        return $false
+    }
 
     $WinResBackup = Get-Content -Raw $WinResPath -Encoding UTF8
     $SysoBackup = $null
+    $ok = $false
     if (Test-Path $GenSyso) { $SysoBackup = [System.IO.File]::ReadAllBytes($GenSyso) }
 
     try {
@@ -883,7 +908,7 @@ function Sync-VersionResource {
             $rc = $LASTEXITCODE
         }
         if ($rc -ne 0) {
-            Write-Host (msg -Key "BackSyncVerFail") -ForegroundColor Yellow
+            Write-Host (msg -Key "BackSyncVerFail") -ForegroundColor Red
         } else {
             $gen = Get-ChildItem -Path $WinResTmp -Filter ("rsrc_windows_" + $TargetGoArch + ".syso") -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($gen) {
@@ -891,14 +916,16 @@ function Sync-VersionResource {
                 $script:SysoTargetPath = $GenSyso
                 $script:SysoTargetBackup = $SysoBackup
                 Write-Host (msg -Key "BackSyncVerDone" -Arg0 $mainVer) -ForegroundColor Green
+                $ok = $true
             } else {
-                Write-Host (msg -Key "BackSyncVerFail") -ForegroundColor Yellow
+                Write-Host (msg -Key "BackSyncVerFail") -ForegroundColor Red
             }
         }
         Remove-Item -Path $WinResTmp -Recurse -Force -ErrorAction SilentlyContinue
     } finally {
         if ($null -ne $WinResBackup) { [System.IO.File]::WriteAllText($WinResPath, $WinResBackup, $utf8NoBom) }
     }
+    return $ok
 }
 
 # ---------------------------------------------------------------------------
@@ -972,16 +999,19 @@ function Invoke-BuildTarget {
             go build -tags "with_gvisor headless" -ldflags="$ldflags" -o $out ./cli
             $rc = $LASTEXITCODE
         } else {
-            if ($Target.GoOs -eq "windows") { Sync-VersionResource -TargetGoArch $Target.GoArch }
-            $env:GOOS = $Target.GoOs
-            $env:GOARCH = $Target.GoArch
-            $env:CGO_ENABLED = "0"
-            if ($Wails) {
-                wails build -platform "$($Target.GoOs)/$($Target.GoArch)" -o $out
-                $rc = $LASTEXITCODE
+            if ($Target.GoOs -eq "windows" -and -not (Sync-VersionResource -TargetGoArch $Target.GoArch)) {
+                $rc = 1
             } else {
-                go build -tags "with_gvisor" -ldflags="$ldflags" -o $out .
-                $rc = $LASTEXITCODE
+                $env:GOOS = $Target.GoOs
+                $env:GOARCH = $Target.GoArch
+                $env:CGO_ENABLED = "0"
+                if ($Wails) {
+                    wails build -platform "$($Target.GoOs)/$($Target.GoArch)" -o $out
+                    $rc = $LASTEXITCODE
+                } else {
+                    go build -tags "with_gvisor" -ldflags="$ldflags" -o $out .
+                    $rc = $LASTEXITCODE
+                }
             }
         }
     } finally {
@@ -1000,14 +1030,125 @@ function Invoke-BuildTarget {
         return $false
     }
 
-    if (Test-Path (Join-Path $ProjectRoot "config")) {
-        Copy-Item -Path (Join-Path $ProjectRoot "config") -Destination (Join-Path $outDir "config") -Recurse -Force
+    # Post-link guard: the icon, the version info and the manifest all travel in
+    # the one .syso, so an empty VersionInfo means cmd/go linked the binary
+    # without it. A zero exit code is not proof the resource made it in, so read
+    # the produced exe back instead of trusting the linker.
+    if ($Target.Type -eq "gui" -and $Target.GoOs -eq "windows") {
+        $linkedVersion = (Get-Item $out -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+        if ([string]::IsNullOrWhiteSpace($linkedVersion)) {
+            Write-Host "[BUILD] FAILED: no Windows icon/version/manifest resource linked into $out" -ForegroundColor Red
+            return $false
+        }
     }
-    if (Test-Path (Join-Path $ProjectRoot "rules")) {
-        Copy-Item -Path (Join-Path $ProjectRoot "rules") -Destination (Join-Path $outDir "rules") -Recurse -Force
+
+    # The portable updater always ships next to the application: the
+    # installer, the portable archive and the MSIX package are all built
+    # from this folder, so the updater and its config must live in it too.
+    if ($Target.Type -eq "gui" -and $Target.GoOs -eq "windows") {
+        if (-not (Build-UpdaterPayload -Arch $Target.Arch -GoArch $Target.GoArch -DestDir $outDir)) {
+            return $false
+        }
+    }
+
+    # Seed folders:
+    # - rules: force-overwrite CONTENTS on every build so rule updates land.
+    #   Copy-Item -Recurse against an existing destination would nest the
+    #   source folder (rules\rules\...) and leave stale top-level files.
+    # - config: seed only when missing; the runtime settings.json next to the
+    #   binary belongs to the user and must survive rebuilds.
+    $rulesSrc = Join-Path $ProjectRoot "rules"
+    if (Test-Path $rulesSrc) {
+        $rulesDst = Join-Path $outDir "rules"
+        New-Item -ItemType Directory -Force -Path $rulesDst | Out-Null
+        Copy-Item -Path (Join-Path $rulesSrc "*") -Destination $rulesDst -Recurse -Force
+    }
+    $configDst = Join-Path $outDir "config"
+    if (-not (Test-Path $configDst)) {
+        $configSrc = Join-Path $ProjectRoot "config"
+        if (Test-Path $configSrc) {
+            Copy-Item -Path $configSrc -Destination $configDst -Recurse -Force
+        }
     }
 
     Write-Host "[BUILD] OK: $($Target.OutDir)\$($Target.OutFile)" -ForegroundColor Green
+    return $true
+}
+
+$updaterAppIds = @{
+    'x64'   = '{3F2E4DA1-5C8B-4ECD-BDC4-426A5965F8D4}'
+    'x86'   = '{3F2E4DA1-5C8B-4ECD-BDC4-426A5965F8D5}'
+    'arm64' = '{3F2E4DA1-5C8B-4ECD-BDC4-426A5965F8D6}'
+}
+
+function Build-UpdaterPayload {
+    param([string]$Arch, [string]$GoArch, [string]$DestDir)
+
+    if (-not $updaterAppIds.ContainsKey($Arch)) {
+        Write-Host "[UPDATER] unsupported architecture: $Arch" -ForegroundColor Red
+        return $false
+    }
+
+    $updaterRoot = Join-Path $ProjectRoot "build\bin\updater\Windows\$Arch"
+    $updaterExe = Join-Path $updaterRoot "SniShaperUpdater.exe"
+    $updaterConfig = Join-Path $updaterRoot "updater.json"
+
+    if (-not (Test-Path $updaterExe)) {
+        New-Item -ItemType Directory -Force -Path $updaterRoot | Out-Null
+        Write-Host "[BUILD] UPDATER Windows/$Arch ($GoArch) -> build\bin\updater\Windows\$Arch\SniShaperUpdater.exe" -ForegroundColor Green
+        try {
+            $env:GOOS = "windows"
+            $env:GOARCH = $GoArch
+            $env:CGO_ENABLED = "0"
+            go build -trimpath -ldflags="-s -w" -o $updaterExe ./updater
+            $rc = $LASTEXITCODE
+        } finally {
+            Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
+        }
+        if ($rc -ne 0 -or -not (Test-Path $updaterExe)) {
+            Write-Host "[BUILD] UPDATER FAILED for $Arch" -ForegroundColor Red
+            return $false
+        }
+    } else {
+        Write-Host "[BUILD] UPDATER Windows/$Arch reused: $updaterExe" -ForegroundColor Green
+    }
+
+    if (-not (Test-Path $updaterConfig)) {
+        $pubKey = ''
+        $seed = $env:UPDATER_ED25519_SEED
+        if ($seed) {
+            $pubOut = Join-Path $updaterRoot 'updater-public-key.txt'
+            & go run ./updater/signmanifest -pub-out $pubOut
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $pubOut)) {
+                $pubKey = (Get-Content -LiteralPath $pubOut -Raw).Trim()
+            }
+        }
+        $config = [ordered]@{
+            manifest_url = "https://github.com/SnishaperTeam/SniShaper/releases/latest/download/updater-manifest-$Arch.json"
+            mirror_urls = @()
+            public_key = $pubKey
+            channel = 'stable'
+            arch = $Arch
+            installer_pattern = '*Setup.exe'
+            installer_name = ''
+            process_names = @('snishaper.exe')
+            app_id = $updaterAppIds[$Arch]
+            install_dir = ''
+            local_version = 'auto'
+            verify_authenticode = $false
+            restart_after_install = $false
+            http_timeout_minutes = 30
+            max_retries = 3
+            max_extract_bytes = 1073741824
+        }
+        [System.IO.File]::WriteAllText($updaterConfig, ($config | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+    }
+
+    Copy-Item -LiteralPath $updaterExe -Destination (Join-Path $DestDir 'SniShaperUpdater.exe') -Force
+    if (Test-Path $updaterConfig) {
+        Copy-Item -LiteralPath $updaterConfig -Destination (Join-Path $DestDir 'updater.json') -Force
+    }
+    Write-Host "[BUILD] UPDATER bundled into $DestDir" -ForegroundColor Green
     return $true
 }
 
@@ -1073,10 +1214,15 @@ if ($BuildMsix) {
     Write-Host "[MSIX] Building MSIX package..." -ForegroundColor Cyan
     Write-Host "==========================================" -ForegroundColor Cyan
 
-    $OutputDir = Join-Path $ProjectRoot "Apppackage"
-    if (Test-Path $OutputDir) {
-        Remove-Item "$OutputDir\*.msix" -Force -ErrorAction SilentlyContinue
-    }
+    # Package artifacts live next to the Windows GUI builds, so the whole
+    # Windows output stays under build\bin\gui\Windows\:
+    #   <name>_<version>_<arch...>.msixbundle  (multi-arch, x64/x86/arm64)
+    #   <name>_<version>_<arch>.msix           (single arch)
+    $OutputDir = Join-Path $ProjectRoot "build\bin\gui\Windows"
+    New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+    Get-ChildItem -Path $OutputDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\.msix(bundle)?$' } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
 
     try {
         winapp --version | Out-Null
@@ -1106,59 +1252,47 @@ if ($BuildMsix) {
         }
     }
 
-    # Packaging source: build\bin\gui\Windows\<arch>
-    $SourceDir = $null
+    # Packaging sources: build\bin\gui\Windows\<arch> for every Windows GUI
+    # architecture built in this run. winapp derives each folder's
+    # architecture from the executable it contains and emits a single
+    # .msixbundle when more than one folder is passed.
+    $ArchOrder = @("x64", "x86", "arm64")
     $guiWinRoot = Join-Path $ProjectRoot "build\bin\gui\Windows"
-    foreach ($candidate in @($HostArch, "x64", "x86", "arm64") | Select-Object -Unique) {
-        $dir = Join-Path $guiWinRoot $candidate
-        if (Test-Path (Join-Path $dir "snishaper.exe")) { $SourceDir = $dir; break }
+    $pkgDirs = @()
+    $selectedArchs = @($Targets | Where-Object { $_.Type -eq "gui" -and $_.Platform -eq "windows" -and $_.State -eq "build" } | ForEach-Object { $_.Arch })
+    if ($selectedArchs.Count -eq 0) { $selectedArchs = $ArchOrder }
+    foreach ($a in $ArchOrder) {
+        if ($selectedArchs -notcontains $a) { continue }
+        $dir = Join-Path $guiWinRoot $a
+        if (Test-Path (Join-Path $dir "snishaper.exe")) { $pkgDirs += $dir }
     }
-    if (-not $SourceDir -and (Test-Path (Join-Path $ProjectRoot "build\bin\snishaper.exe"))) {
-        # backward compatibility with the legacy flat layout
-        $SourceDir = Join-Path $ProjectRoot "build\bin"
-    }
-    if (-not $SourceDir) {
+    if ($pkgDirs.Count -eq 0) {
         Write-Host "[ERROR] No Windows GUI output found (expected build\bin\gui\Windows\<arch>\snishaper.exe)" -ForegroundColor Red
         if (-not $Silent) { Read-Host (msg -Key "Exit") }
         exit 1
     }
-    Write-Host "[MSIX] Source directory: $SourceDir" -ForegroundColor Green
+    Write-Host "[MSIX] Source folders: $($pkgDirs -join ', ')" -ForegroundColor Green
 
     [xml]$ManifestXml = Get-Content $ManifestPath
     $PkgName = $ManifestXml.Package.Identity.Name
     $PkgVersion = $ManifestXml.Package.Identity.Version
 
-    $ExePath = Join-Path $SourceDir "snishaper.exe"
-    $fs = [System.IO.File]::OpenRead($ExePath)
-    $fs.Seek(0x3C, [System.IO.SeekOrigin]::Begin) | Out-Null
-    $peOffset = New-Object byte[] 4
-    $fs.Read($peOffset, 0, 4) | Out-Null
-    $offset = [BitConverter]::ToUInt32($peOffset, 0)
-    $fs.Seek($offset + 4, [System.IO.SeekOrigin]::Begin) | Out-Null
-    $machine = New-Object byte[] 2
-    $fs.Read($machine, 0, 2) | Out-Null
-    $fs.Close()
-    $machineId = [BitConverter]::ToUInt16($machine, 0)
-    switch ($machineId) {
-        0x8664 { $PkgArch = "x64" }
-        0xAA64 { $PkgArch = "arm64" }
-        0x014C { $PkgArch = "x86" }
-        default { $PkgArch = "unknown" }
-    }
-    Write-Host "[MSIX] Detected architecture: $PkgArch" -ForegroundColor Green
+    $archNames = @($pkgDirs | ForEach-Object { Split-Path -Leaf $_ })
+    $pkgExt = if ($archNames.Count -gt 1) { ".msixbundle" } else { ".msix" }
+    $MsixFileName = "${PkgName}_${PkgVersion}_$($archNames -join '_')$pkgExt"
+    $MsixTarget = Join-Path $OutputDir $MsixFileName
+    Write-Host "[MSIX] Target: $MsixFileName ($($archNames -join '/'))" -ForegroundColor Green
 
-    $MsixFileName = "${PkgName}_${PkgVersion}_${PkgArch}.msix"
-
-    winapp pack $SourceDir --manifest $ManifestPath --output (Join-Path $OutputDir $MsixFileName)
+    winapp pack @pkgDirs --manifest $ManifestPath --output $MsixTarget
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[ERROR] winapp pack failed." -ForegroundColor Red
         if (-not $Silent) { Read-Host (msg -Key "Exit") }
         exit 1
     }
 
-    $MsixFile = Get-Item (Join-Path $OutputDir $MsixFileName) -ErrorAction SilentlyContinue
+    $MsixFile = Get-Item $MsixTarget -ErrorAction SilentlyContinue
     if (-not $MsixFile) {
-        Write-Host "[ERROR] No .msix file found in $OutputDir." -ForegroundColor Red
+        Write-Host "[ERROR] Package file not found: $MsixTarget" -ForegroundColor Red
         if (-not $Silent) { Read-Host (msg -Key "Exit") }
         exit 1
     }
@@ -1171,7 +1305,7 @@ if ($BuildMsix) {
             if (-not $Silent) { Read-Host (msg -Key "Exit") }
             exit 1
         }
-        Write-Host "[MSIX] Package signed successfully at $OutputDir" -ForegroundColor Green
+        Write-Host "[MSIX] Package signed successfully: $MsixTarget" -ForegroundColor Green
     } else {
         Write-Host "[MSIX] Skipping signing as requested." -ForegroundColor Yellow
         $UnsignedName = "unsigned_" + $MsixFile.Name
